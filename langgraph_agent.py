@@ -1,22 +1,21 @@
 import os
+import json
 from typing import Annotated, List, TypedDict, Literal
 from langgraph.graph import END, StateGraph
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_community.document_loaders import PyMuPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain_chroma import Chroma
 from termcolor import colored
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable
 
 from config import get_embeddings, get_llm, DATA_FOLDER, DB_FOLDER, FILES
 
 
+# Generic Retry Logic (Provider agnostic)
 retry_logic = retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type((ResourceExhausted, ServiceUnavailable, Exception))
+    retry=retry_if_exception_type(Exception)
 )
 
 
@@ -24,43 +23,16 @@ def initialize_vector_dbs():
     embeddings = get_embeddings()
     retrievers = {}
     
-    if not os.path.exists(DATA_FOLDER):
-        os.makedirs(DATA_FOLDER)
-        print(colored(f"⚠️ Put PDFs into {DATA_FOLDER} folder", "red"))
-        return {}
-
-    for key, filename in FILES.items():
+    for key in FILES.keys():
         persist_dir = os.path.join(DB_FOLDER, key)
-        file_path = os.path.join(DATA_FOLDER, filename)
 
         if os.path.exists(persist_dir):
-            print(f"✅ Found existing DB for {key}")
             vectorstore = Chroma(persist_directory=persist_dir, embedding_function=embeddings)
-        elif os.path.exists(file_path):
-            print(f"🔨 Building index for {key} (This happens once)...")
-            loader = PyMuPDFLoader(file_path)
-            docs = loader.load()
-
-            # TODO (Optional): Clean the data to remove noise (e.g., "\n")
-            # You can write a loop here to replace newlines with spaces
-            # or remove headers/footers.
-            # Example (Dirty data cleanup):
-            # for doc in docs:
-            #     doc.page_content = doc.page_content.replace("\n", " ")
-
-            splitter = RecursiveCharacterTextSplitter(
-                chunk_size=2000,     # <--- can modify
-                chunk_overlap=400,   # <--- can modify 
-                separators=["\n\n", "\n", " ", ""] 
-            )
-            splits = splitter.split_documents(docs)
-            
-            vectorstore = Chroma.from_documents(splits, embeddings, persist_directory=persist_dir)
+            retrievers[key] = vectorstore.as_retriever(search_kwargs={"k": 3})
         else:
-            print(colored(f"❌ Missing file: {filename}", "red"))
+            print(colored(f"❌ Error: Database for '{key}' not found!", "red"))
+            print(colored(f"⚠️ Please run 'python build_rag.py' first.", "yellow"))
             continue
-        
-        retrievers[key] = vectorstore.as_retriever(search_kwargs={"k": 3})
     
     return retrievers
 
@@ -81,35 +53,46 @@ def retrieve_node(state: AgentState):
     question = state["question"]
     llm = get_llm()
     
-    docs_content = ""
-
-    # --- [START] ---
+    # --- [START] Improved Routing Logic ---
+    options = list(FILES.keys()) + ["both", "none"]
+    router_prompt = f"""
+    Analyze the user question and route it to the correct data source.
+    Options: {', '.join(options)}.
     
-    # Hint：You can use a prompt like below to guide the LLM
-    # router_prompt = """
-    # Analyze the user question and route it to the correct data source.
-    # Options: "apple", "tesla", "both", "none".
-    # Output only the option name in JSON format: {"datasource": "..."}
-    # Question: {question}
-    # """
+    Output ONLY valid JSON: {{"datasource": "..."}}
+    User Question: {question}
+    """
     
-    # TODO: 1. Invoke LLM with router_prompt
-    # TODO: 2. Parse JSON output
-    # TODO: 3. Set `target` variable based on output
-    print(colored("⚠️ WARNING: You need to implement the routing logic", "yellow"))
-    target = "both" # <--- Need to remove this hardcoded line after implementing the above steps and get the target from LLM output
+    try:
+        response = llm.invoke(router_prompt)
+        content = response.content.strip()
+        # Handle cases where LLM might wrap JSON in backticks
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0].strip()
+            
+        res_json = json.loads(content)
+        target = res_json.get("datasource", "both")
+    except Exception as e:
+        print(colored(f"⚠️ Error parsing router output: {e}. Defaulting to 'both'.", "yellow"))
+        target = "both"
     
+    print(colored(f"🎯 Routing to: {target}", "cyan"))
     # --- [END] ---
 
-    if target == "apple" or target == "both":
-        if "apple" in RETRIEVERS:
-            docs = RETRIEVERS["apple"].invoke(question)
-            docs_content += "\n\n[Source: Apple 10-K]\n" + "\n".join([d.page_content for d in docs])
-            
-    if target == "tesla" or target == "both":
-        if "tesla" in RETRIEVERS:
-            docs = RETRIEVERS["tesla"].invoke(question)
-            docs_content += "\n\n[Source: Tesla 10-K]\n" + "\n".join([d.page_content for d in docs])
+    docs_content = ""
+    targets_to_search = []
+    if target == "both":
+        targets_to_search = list(FILES.keys())
+    elif target in FILES:
+        targets_to_search = [target]
+    
+    for t in targets_to_search:
+        if t in RETRIEVERS:
+            docs = RETRIEVERS[t].invoke(question)
+            source_name = t.capitalize()
+            docs_content += f"\n\n[Source: {source_name}]\n" + "\n".join([d.page_content for d in docs])
 
     return {"documents": docs_content, "search_count": state["search_count"] + 1}
 
@@ -133,12 +116,8 @@ def grade_documents_node(state: AgentState):
     response = llm.invoke(msg)
     content = response.content.strip().lower()
     
-    if "yes" in content:
-        grade = "yes"
-    else:
-        grade = "no"
-    
-    print(f"   Relevance Grade: {grade} (Raw: {content})")
+    grade = "yes" if "yes" in content else "no"
+    print(f"   Relevance Grade: {grade}")
     return {"needs_rewrite": grade}
 
 @retry_logic
@@ -147,11 +126,11 @@ def generate_node(state: AgentState):
     question = state["question"]
     documents = state["documents"]
     llm = get_llm() 
-    # You can modify prompt, write the prompt LLM can generate the final answer based on the retrieved documents
+    
     prompt = ChatPromptTemplate.from_messages([
         ("system", "You are a financial analyst. Use the provided context to answer the question. \n"
                    "If the context doesn't contain the answer, say you don't know. \n"
-                   "ALWAYS cite the source (e.g., [Source: Apple]).\n\nContext:\n{context}"),
+                   "ALWAYS cite the source in brackets (e.g., [Source: Apple]).\n\nContext:\n{context}"),
         ("human", "{question}"),
     ])
     
@@ -164,7 +143,7 @@ def rewrite_node(state: AgentState):
     print(colored("--- 🔄 REWRITING QUERY ---", "red"))
     question = state["question"]
     llm = get_llm()
-    # You can modify msg, write the prompt LLM can rewrite the question to be more specific
+    
     msg = [ 
         HumanMessage(content=f"The previous search for '{question}' yielded irrelevant results. \n"
                              f"Please rephrase this question to be more specific or use better keywords for a financial search engine. \n"
@@ -212,53 +191,23 @@ def build_graph():
 def run_graph_agent(question: str):
     app = build_graph()
     inputs = {"question": question, "search_count": 0, "needs_rewrite": "no", "documents": "", "generation": ""}
+    # Using stream to see progress if needed, but invoke is fine for simple return
     result = app.invoke(inputs)
     return result["generation"]
 
+# --- Legacy ReAct Agent ---
 def run_legacy_agent(question: str):
-    print(colored("--- 🤖 RUNNING LEGACY AGENT (Linear) ---", "magenta"))
-    AgentExecutor = None
-    create_tool_calling_agent = None
-    create_retriever_tool = None
-    hub = None
-    try:
-        from langchain.agents import AgentExecutor, create_react_agent
-    except ImportError:
-        try:
-            from langchain.agents.agent import AgentExecutor
-        except ImportError:
-            pass
-    try:
-        from langchain.agents import create_tool_calling_agent
-    except ImportError:
-        pass
-    try:
-        from langchain.tools.retriever import create_retriever_tool
-        from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-        from langchain_core.prompts import PromptTemplate
-        from langchain.tools.render import render_text_description
-    except ImportError:
-        try:
-            from langchain.agents.agent_toolkits import create_retriever_tool
-        except ImportError:
-            pass
-    try:
-        from langchain import hub
-    except ImportError:
-        pass
+    print(colored("--- 🤖 RUNNING LEGACY AGENT (ReAct) ---", "magenta"))
+    from langchain.agents import AgentExecutor, create_react_agent
+    from langchain.tools.retriever import create_retriever_tool
+    from langchain.tools.render import render_text_description
 
     tools = []
-    if "apple" in RETRIEVERS:
+    for key, retriever in RETRIEVERS.items():
         tools.append(create_retriever_tool(
-            RETRIEVERS["apple"], 
-            "search_apple_financials", 
-            "Searches Apple's 2024 financial statements."
-        ))
-    if "tesla" in RETRIEVERS:
-        tools.append(create_retriever_tool(
-            RETRIEVERS["tesla"], 
-            "search_tesla_financials", 
-            "Searches Tesla's 2024 10-K report."
+            retriever, 
+            f"search_{key}_financials", 
+            f"Searches {key.capitalize()}'s financial data."
         ))
 
     if not tools:
@@ -266,47 +215,39 @@ def run_legacy_agent(question: str):
 
     llm = get_llm()
 
+    template = """Answer the following questions as best you can. You have access to the following tools:
 
-    # ============================================================
-    # TODO: Define the ReAct Prompt Template
-    # ============================================================
-    # Your task is to write the prompt that tells the LLM how to reason and act and must let LLM answer in English.
-    # The ReAct framework REQUIRES the following structure in your string:
-    #
-    # 1. Description of available tools: {tools}
-    # 2. Instruction on the output format:
-    #    - Thought: ...
-    #    - Action: ... (must be one of [{tool_names}])
-    #    - Action Input: ...
-    #    - Observation: ...
-    # 3. The input question: {input}
-    # 4. The history of thoughts/actions: {agent_scratchpad}
-    #
-    # Write your template string below:
+{tools}
 
-    template = """
-    
-    """
+Use the following format:
+
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be one of [{tool_names}]
+Action Input: the input to the action
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat N times)
+Thought: I now know the final answer
+Final Answer: the final answer to the original input question
+
+Begin!
+
+Question: {input}
+Thought: {agent_scratchpad}"""
+
     prompt = PromptTemplate.from_template(template)
     prompt = prompt.partial(
-            tools=render_text_description(tools),
-            tool_names=", ".join([t.name for t in tools])
+        tools=render_text_description(tools),
+        tool_names=", ".join([t.name for t in tools])
     )
 
-    def formatting_error_handler(error) -> str:
-        error_str = str(error)
-        if "Final Answer:" in error_str:
-            return error_str.split("Final Answer:")[-1].strip()
-        return "Agent failed to parse correctly, but here is the raw thought: " + error_str[:100]
-    
     agent = create_react_agent(llm, tools, prompt)
-
     agent_executor = AgentExecutor(
-            agent=agent, 
-            tools=tools, 
-            verbose=False,
-            handle_parsing_errors=formatting_error_handler,
-            max_iterations=5
+        agent=agent, 
+        tools=tools, 
+        verbose=True, 
+        handle_parsing_errors=True,
+        max_iterations=5
     )
 
     try:
