@@ -56,8 +56,9 @@ def retrieve_node(state: AgentState):
     # --- [START] Improved Routing Logic ---
     options = list(FILES.keys()) + ["both", "none"]
     router_prompt = f"""
-    Analyze the user question and route it to the correct data source.
+    Analyze the user question and classify it to the correct data source based on the entity mentioned.
     Options: {', '.join(options)}.
+    If the question mentions Apple, route to 'apple'. If Tesla, route to 'tesla'. If both, route to 'both'. If neither, route to 'none'.
     
     Output ONLY valid JSON: {{"datasource": "..."}}
     User Question: {question}
@@ -129,8 +130,8 @@ def generate_node(state: AgentState):
     
     prompt = ChatPromptTemplate.from_messages([
         ("system", "You are a financial analyst. Use the provided context to answer the question. \n"
-                   "If the context doesn't contain the answer, say you don't know. \n"
-                   "ALWAYS cite the source in brackets (e.g., [Source: Apple]).\n\nContext:\n{context}"),
+                   "If the context doesn't contain the answer, honestly state 'I don't know' instead of hallucinating. \n"
+                   "Strictly cite sources in brackets (e.g., [Source: Apple] or [Source: Apple 10-K]).\n\nContext:\n{context}"),
         ("human", "{question}"),
     ])
     
@@ -146,8 +147,9 @@ def rewrite_node(state: AgentState):
     
     msg = [ 
         HumanMessage(content=f"The previous search for '{question}' yielded irrelevant results. \n"
-                             f"Please rephrase this question to be more specific or use better keywords for a financial search engine. \n"
-                             f"Output ONLY the new question text.")
+                             f"Please rephrase this question to be more specific or use better financial terminology keywords for a search engine. \n"
+                             f"For example, transform vague queries (e.g., 'how much did they spend on new tech') into precise terms (e.g., 'Research and Development expenses').\n"
+                             f"Output ONLY the new question text without any markdown.")
     ]
     response = llm.invoke(msg)
     new_query = response.content.strip()
@@ -229,6 +231,11 @@ Observation: the result of the action
 ... (this Thought/Action/Action Input/Observation can repeat N times)
 Thought: I now know the final answer
 Final Answer: the final answer to the original input question
+
+Behavioral Constraints:
+1. English Only: The Final Answer must be in English, even if the user asks in Chinese.
+2. Year Precision: Explicitly distinguish between 2024, 2023, and 2022 columns in financial tables.
+3. Honesty: If the exact 2024 figure is not found, state "I don't know" rather than guessing.
 
 Begin!
 
